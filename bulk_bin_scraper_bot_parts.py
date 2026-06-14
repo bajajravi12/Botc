@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
-# BULK BIN SCRAPER TELEGRAM BOT v6.0
+# BULK BIN SCRAPER TELEGRAM BOT v6.1 - FORMAT FIXED
+# Format: CC_NUMBER|MM|YY|CVV - One per line, no wrapping
 
-import os
 import requests
 import time
 import random
 import re
+import os
 from dataclasses import dataclass
 from typing import Optional, List, Dict
 from functools import wraps
 from telegram import Update
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# ============================================
+# CONFIGURATION - FROM ENVIRONMENT VARIABLES
+# ============================================
+BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
+WEBHOOK_URL = os.environ.get('WEBHOOK_URL', '')
+PORT = int(os.environ.get('PORT', '8080'))
 REQUEST_TIMEOUT = 10
 MAX_RETRIES = 3
 RETRY_DELAY = 1
@@ -42,6 +48,8 @@ class CCInfo:
     is_valid: bool
 
     def to_pipe_format(self):
+        # EXACT FORMAT: CC_NUMBER|MM|YY|CVV
+        # No spaces, no newlines inside
         return f'{self.number}|{self.month}|{self.year}|{self.cvv}'
 
 class RamCache:
@@ -270,7 +278,7 @@ class BulkBinScraper:
         for _ in range(quantity):
             cc_num = self.luhn.generate_valid(bin_number, length)
             month = f'{random.randint(1, 12):02d}'
-            year = str(random.randint(2025, 2030))[2:]
+            year = f'{random.randint(2026, 2030)}'[2:]
             cvv = ''.join(str(random.randint(0, 9)) for _ in range(cvv_len))
             ccs.append(CCInfo(
                 number=cc_num, bin=bin_number,
@@ -280,10 +288,13 @@ class BulkBinScraper:
         self.cache.add_ccs(ccs)
         return ccs, None
 
+# ============================================
+# TELEGRAM BOT HANDLERS
+# ============================================
 scraper = BulkBinScraper()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome = '🎯 *BULK BIN SCRAPER BOT v6.0*\n\n*Commands:*\n🔍 `/verify 414720` — Check if BIN is real\n📋 `/range 400000 400100` — Scrape BIN range\n💳 `/cc 414720 10` — Generate CCs (real BIN only)\n🔥 `/mass 414720,510000,370000 5` — Mass CC gen\n📊 `/stats` — Session statistics\n\n*Rules:*\n✅ Real BIN = Bank info + CC generation\n❌ Fake BIN = Blocked\n🚀 No limit on CC generation'
+    welcome = '🎯 *BULK BIN SCRAPER BOT v6.1*\n\n*Commands:*\n🔍 `/verify 414720` — Check if BIN is real\n📋 `/range 400000 400100` — Scrape BIN range\n💳 `/cc 414720 10` — Generate CCs (real BIN only)\n🔥 `/mass 414720,510000,370000 5` — Mass CC gen\n📊 `/stats` — Session statistics\n\n*Rules:*\n✅ Real BIN = Bank info + CC generation\n❌ Fake BIN = Blocked\n🚀 No limit on CC generation'
     await update.message.reply_text(welcome, parse_mode='Markdown')
 
 async def verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -346,7 +357,7 @@ async def cc_gen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('❌ BIN must be 6 digits!')
         return
     if qty > 999999:
-        await update.message.reply_text('⚠️ Max 1000 CCs per request!')
+        await update.message.reply_text('⚠️ Max 999999 CCs per request!')
         qty = 999999
     await update.message.reply_text(f'⏳ Verifying BIN `{bin_num}`...', parse_mode='Markdown')
     bin_info = scraper.verify_bin(bin_num)
@@ -361,16 +372,19 @@ async def cc_gen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if error:
         await update.message.reply_text(error)
         return
-    output_lines = [f'💳 *{bin_info.bank}* — {len(ccs)} CCs', '', '*Format:* `CC|MM|YY|CVV`', '']
+    
+    # FIXED: Always send as file to avoid text wrapping issues
+    from io import StringIO
+    lines = []
     for cc in ccs:
-        output_lines.append(f'`{cc.to_pipe_format()}`')
-    text = '\n'.join(output_lines)
-    if len(text) > 4000:
-        from io import StringIO
-        file = StringIO('\n'.join([cc.to_pipe_format() for cc in ccs]))
-        await update.message.reply_document(document=file, filename=f'ccs_{bin_num}.txt', caption=f'✅ {len(ccs)} CCs for `{bin_num}`')
-    else:
-        await update.message.reply_text(text, parse_mode='Markdown')
+        lines.append(cc.to_pipe_format())
+    file_content = '\n'.join(lines)
+    file = StringIO(file_content)
+    await update.message.reply_document(
+        document=file,
+        filename=f'ccs_{bin_num}.txt',
+        caption=f'✅ {len(ccs)} CCs for `{bin_num}`\n💳 Format: CC|MM|YY|CVV'
+    )
 
 async def mass_gen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -393,30 +407,19 @@ async def mass_gen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not all_ccs:
         await update.message.reply_text('❌ No CCs generated! All BINs might be fake.')
         return
-
-    # Smart splitting for mass gen too
-    PART_SIZE = 500
-    total = len(all_ccs)
-
-    if total <= PART_SIZE:
-        from io import StringIO
-        file = StringIO('\n'.join([cc.to_pipe_format() for cc in all_ccs]))
-        await update.message.reply_document(document=file, filename=f'mass_ccs_{total}.txt', caption=f'✅ {total} CCs generated from {len(bins_list)} BINs')
-    else:
-        parts = (total + PART_SIZE - 1) // PART_SIZE
-        await update.message.reply_text(f'📦 Splitting into {parts} parts (500 CCs each)...')
-        for part_num in range(parts):
-            start_idx = part_num * PART_SIZE
-            end_idx = min(start_idx + PART_SIZE, total)
-            part_ccs = all_ccs[start_idx:end_idx]
-            from io import StringIO
-            file = StringIO('\n'.join([cc.to_pipe_format() for cc in part_ccs]))
-            await update.message.reply_document(
-                document=file, 
-                filename=f'mass_ccs_part{part_num+1}.txt',
-                caption=f'📦 Part {part_num+1}/{parts}: {len(part_ccs)} CCs'
-            )
-            time.sleep(1)
+    
+    # FIXED: Always send as file
+    from io import StringIO
+    lines = []
+    for cc in all_ccs:
+        lines.append(cc.to_pipe_format())
+    file_content = '\n'.join(lines)
+    file = StringIO(file_content)
+    await update.message.reply_document(
+        document=file,
+        filename=f'mass_ccs_{len(all_ccs)}.txt',
+        caption=f'✅ {len(all_ccs)} CCs generated from {len(bins_list)} BINs\n💳 Format: CC|MM|YY|CVV'
+    )
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = scraper.cache.get_stats()
@@ -436,6 +439,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text('Send: `/cc 414720 10`', parse_mode='Markdown')
 
 def main():
+    if not BOT_TOKEN:
+        print('❌ ERROR: BOT_TOKEN not set!')
+        print('Set environment variable: BOT_TOKEN=your_token_here')
+        return
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('verify', verify))
@@ -444,8 +451,13 @@ def main():
     application.add_handler(CommandHandler('mass', mass_gen))
     application.add_handler(CommandHandler('stats', stats))
     application.add_handler(CallbackQueryHandler(button_callback))
-    print('🤖 Bot started! Press Ctrl+C to stop.')
-    application.run_polling()
+    print('🤖 Bot starting...')
+    if WEBHOOK_URL:
+        print(f'🌐 Webhook mode: {WEBHOOK_URL}')
+        application.run_webhook(listen='0.0.0.0', port=PORT, webhook_url=WEBHOOK_URL)
+    else:
+        print('🔄 Polling mode...')
+        application.run_polling()
 
 if __name__ == '__main__':
     main()
