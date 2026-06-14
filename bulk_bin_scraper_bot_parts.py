@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-# BULK BIN SCRAPER BOT v7.0 - PRODUCTION READY
-# Finds REAL BINs only | CC|MM|YY|CVV format
-# Fixed: Async I/O, Luhn algo, StringIO, Memory leaks, Input validation
+# BULK BIN SCRAPER BOT v7.0 - RAILWAY READY
+# Format: CC_NUMBER|MM|YY|CVV - One per line, no wrapping
+# Pure synchronous - optimized for Railway/Render/Heroku deploy
 
-import asyncio
-import aiohttp
+import requests
 import time
 import random
 import re
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, List, Dict
 from functools import wraps
 from io import BytesIO
@@ -17,11 +16,11 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # ============================================
-# CONFIGURATION - HARDCODED (As per your req)
+# CONFIGURATION - HARDCODED
 # ============================================
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # 🔴 CHANGE THIS
-WEBHOOK_URL = "YOUR_WEBHOOK_URL_HERE"  # 🔴 CHANGE THIS (or leave empty for polling)
-PORT = 8080
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # 🔴 CHANGE THIS
+WEBHOOK_URL = ""  # Leave empty for polling (Railway mein polling best hai)
+PORT = int(os.environ.get('PORT', '8080'))
 REQUEST_TIMEOUT = 10
 MAX_RETRIES = 3
 RETRY_DELAY = 1
@@ -66,7 +65,6 @@ class RamCache:
 
     def add_bin(self, info):
         if len(self.bins) >= self.max_bins:
-            # FIFO eviction
             oldest = next(iter(self.bins))
             del self.bins[oldest]
         self.bins[info.bin] = info
@@ -79,7 +77,6 @@ class RamCache:
 
     def add_ccs(self, ccs):
         self.ccs.extend(ccs)
-        # Trim if exceeds max
         if len(self.ccs) > self.max_ccs:
             self.ccs = self.ccs[-self.max_ccs:]
 
@@ -97,6 +94,20 @@ class RamCache:
             'banks': sorted(banks.items(), key=lambda x: x[1], reverse=True)[:10]
         }
 
+def retry_on_failure(max_attempts=MAX_RETRIES, delay=RETRY_DELAY):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_attempts):
+                try:
+                    return func(*args, **kwargs)
+                except (requests.RequestException, requests.Timeout):
+                    if attempt < max_attempts - 1:
+                        time.sleep(delay * (attempt + 1))
+            return None
+        return wrapper
+    return decorator
+
 class LuhnValidator:
     @staticmethod
     def generate_valid(bin_number, length=16):
@@ -104,12 +115,10 @@ class LuhnValidator:
         remaining = length - len(bin_number) - 1
         random_digits = ''.join(str(random.randint(0, 9)) for _ in range(remaining))
         partial = bin_number + random_digits
-        # Calculate check digit (standard Luhn)
         total = 0
-        reverse_digits = partial[::-1]
-        for i, d in enumerate(reverse_digits):
+        for i, d in enumerate(partial[::-1]):
             n = int(d)
-            if i % 2 == 0:  # 0-indexed from right = odd positions in 1-indexed
+            if i % 2 == 0:
                 n *= 2
                 if n > 9:
                     n -= 9
@@ -122,8 +131,7 @@ class LuhnValidator:
         if not number or not number.isdigit() or len(number) < 13:
             return False
         total = 0
-        reverse_digits = number[::-1]
-        for i, d in enumerate(reverse_digits):
+        for i, d in enumerate(number[::-1]):
             n = int(d)
             if i % 2 == 1:
                 n *= 2
@@ -182,129 +190,104 @@ def safe_get(data, key, default='Unknown'):
 
 class BulkBinScraper:
     def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json'})
         self.luhn = LuhnValidator()
         self.validator = BinValidator()
         self.cache = RamCache(max_bins=CACHE_MAX_BINS, max_ccs=CACHE_MAX_CCS)
-        self.session = None  # Will be created per-request in async context
 
-    async def _get_session(self):
-        if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession(
-                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'},
-                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
-            )
-        return self.session
-
-    async def _fetch_binlist(self, bin_number):
-        session = await self._get_session()
+    @retry_on_failure()
+    def _fetch_binlist(self, bin_number):
         url = f'https://lookup.binlist.net/{bin_number}'
-        for attempt in range(MAX_RETRIES):
-            try:
-                async with session.get(url) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        bank_data = data.get('bank', {})
-                        if isinstance(bank_data, list):
-                            bank_data = bank_data[0] if bank_data else {}
-                        bank = bank_data.get('name', '') if isinstance(bank_data, dict) else 'Unknown'
-                        brand = (data.get('scheme') or 'Unknown').upper()
-                        
-                        if bank in ('Unknown', '', None):
-                            defaults = {
-                                'DISCOVER': 'Discover Financial Services',
-                                'AMEX': 'American Express',
-                                'JCB': 'JCB Co., Ltd.',
-                                'VISA': 'Visa Inc.',
-                                'MASTERCARD': 'Mastercard Inc.'
-                            }
-                            bank = defaults.get(brand, f'{brand} ISSUER')
-                        
-                        country_data = data.get('country', {})
-                        if isinstance(country_data, list):
-                            country_data = country_data[0] if country_data else {}
-                        
-                        is_real = bank not in ('Unknown', f'{brand} ISSUER', '')
-                        
-                        return BinInfo(
-                            bin=bin_number, bank=bank,
-                            country=safe_get(country_data, 'name', 'Unknown'),
-                            country_code=safe_get(country_data, 'alpha2', 'XX'),
-                            brand=brand,
-                            type=(data.get('type') or 'Unknown').capitalize(),
-                            level=data.get('brand', 'Unknown'),
-                            currency=safe_get(country_data, 'currency', 'Unknown'),
-                            source='binlist',
-                            is_real=is_real
-                        )
-                    elif response.status == 429:
-                        await asyncio.sleep(RETRY_DELAY * (attempt + 1))
-                    else:
-                        return None
-            except Exception:
-                if attempt < MAX_RETRIES - 1:
-                    await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+        r = self.session.get(url, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            data = r.json()
+            bank_data = data.get('bank', {})
+            if isinstance(bank_data, list):
+                bank_data = bank_data[0] if bank_data else {}
+            bank = bank_data.get('name', '') if isinstance(bank_data, dict) else 'Unknown'
+            brand = (data.get('scheme') or 'Unknown').upper()
+            
+            if bank in ('Unknown', '', None):
+                defaults = {
+                    'DISCOVER': 'Discover Financial Services',
+                    'AMEX': 'American Express',
+                    'JCB': 'JCB Co., Ltd.',
+                    'VISA': 'Visa Inc.',
+                    'MASTERCARD': 'Mastercard Inc.'
+                }
+                bank = defaults.get(brand, f'{brand} ISSUER')
+            
+            country_data = data.get('country', {})
+            if isinstance(country_data, list):
+                country_data = country_data[0] if country_data else {}
+            
+            is_real = bank not in ('Unknown', f'{brand} ISSUER', '')
+            
+            return BinInfo(
+                bin=bin_number, bank=bank,
+                country=safe_get(country_data, 'name', 'Unknown'),
+                country_code=safe_get(country_data, 'alpha2', 'XX'),
+                brand=brand,
+                type=(data.get('type') or 'Unknown').capitalize(),
+                level=data.get('brand', 'Unknown'),
+                currency=safe_get(country_data, 'currency', 'Unknown'),
+                source='binlist',
+                is_real=is_real
+            )
         return None
 
-    async def _fetch_handyapi(self, bin_number):
-        session = await self._get_session()
+    @retry_on_failure()
+    def _fetch_handyapi(self, bin_number):
         url = f'https://data.handyapi.com/bin/{bin_number}'
-        for attempt in range(MAX_RETRIES):
-            try:
-                async with session.get(url) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        if data.get('Status') == 'SUCCESS':
-                            issuer = data.get('Issuer', '')
-                            if isinstance(issuer, list):
-                                issuer = issuer[0] if issuer else 'Unknown'
-                            bank = str(issuer) if issuer else 'Unknown'
-                            brand = (data.get('Scheme') or 'Unknown').upper()
-                            
-                            if bank in ('Unknown', '', None):
-                                defaults = {
-                                    'DISCOVER': 'Discover Financial Services',
-                                    'AMEX': 'American Express',
-                                    'JCB': 'JCB Co., Ltd.',
-                                    'VISA': 'Visa Inc.',
-                                    'MASTERCARD': 'Mastercard Inc.'
-                                }
-                                bank = defaults.get(brand, f'{brand} ISSUER')
-                            
-                            country_data = data.get('Country', {})
-                            if isinstance(country_data, list):
-                                country_data = country_data[0] if country_data else {}
-                            
-                            is_real = bank not in ('Unknown', f'{brand} ISSUER', '')
-                            
-                            return BinInfo(
-                                bin=bin_number, bank=bank,
-                                country=safe_get(country_data, 'Name', 'Unknown'),
-                                country_code=safe_get(country_data, 'A2', 'XX'),
-                                brand=brand,
-                                type=(data.get('Type') or 'Unknown').capitalize(),
-                                level=data.get('CardTier', 'Unknown'),
-                                currency=safe_get(country_data, 'Currency', 'Unknown'),
-                                source='handyapi',
-                                is_real=is_real
-                            )
-                    elif response.status == 429:
-                        await asyncio.sleep(RETRY_DELAY * (attempt + 1))
-            except Exception:
-                if attempt < MAX_RETRIES - 1:
-                    await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+        r = self.session.get(url, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get('Status') == 'SUCCESS':
+                issuer = data.get('Issuer', '')
+                if isinstance(issuer, list):
+                    issuer = issuer[0] if issuer else 'Unknown'
+                bank = str(issuer) if issuer else 'Unknown'
+                brand = (data.get('Scheme') or 'Unknown').upper()
+                
+                if bank in ('Unknown', '', None):
+                    defaults = {
+                        'DISCOVER': 'Discover Financial Services',
+                        'AMEX': 'American Express',
+                        'JCB': 'JCB Co., Ltd.',
+                        'VISA': 'Visa Inc.',
+                        'MASTERCARD': 'Mastercard Inc.'
+                    }
+                    bank = defaults.get(brand, f'{brand} ISSUER')
+                
+                country_data = data.get('Country', {})
+                if isinstance(country_data, list):
+                    country_data = countryData[0] if country_data else {}
+                
+                is_real = bank not in ('Unknown', f'{brand} ISSUER', '')
+                
+                return BinInfo(
+                    bin=bin_number, bank=bank,
+                    country=safe_get(country_data, 'Name', 'Unknown'),
+                    country_code=safe_get(country_data, 'A2', 'XX'),
+                    brand=brand,
+                    type=(data.get('Type') or 'Unknown').capitalize(),
+                    level=data.get('CardTier', 'Unknown'),
+                    currency=safe_get(country_data, 'Currency', 'Unknown'),
+                    source='handyapi',
+                    is_real=is_real
+                )
         return None
 
-    async def verify_bin(self, bin_number):
+    def verify_bin(self, bin_number):
         if not self.validator.validate_format(bin_number):
             return None
         cached = self.cache.get_bin(bin_number)
         if cached:
             return cached
-        
-        # Try binlist first, then handyapi
         for source in [self._fetch_binlist, self._fetch_handyapi]:
             try:
-                result = await source(bin_number)
+                result = source(bin_number)
                 if result:
                     self.cache.add_bin(result)
                     return result
@@ -312,11 +295,11 @@ class BulkBinScraper:
                 continue
         return None
 
-    async def generate_valid_cc(self, bin_number, quantity=1):
+    def generate_valid_cc(self, bin_number, quantity=1):
         if not self.validator.validate_format(bin_number):
             return [], '❌ Invalid BIN format (must be 6 digits)'
         
-        bin_info = await self.verify_bin(bin_number)
+        bin_info = self.verify_bin(bin_number)
         if not bin_info:
             return [], f'🚫 BIN `{bin_number}` not found in any database'
         
@@ -376,17 +359,17 @@ async def verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('❌ BIN must be exactly 6 digits!')
         return
     
-    msg = await update.message.reply_text(f'⏳ Verifying BIN `{bin_num}`...', parse_mode='Markdown')
-    result = await scraper.verify_bin(bin_num)
+    await update.message.reply_text(f'⏳ Verifying BIN `{bin_num}`...', parse_mode='Markdown')
+    result = scraper.verify_bin(bin_num)
     
     if not result:
-        await msg.edit_text(f'🚫 BIN `{bin_num}` not found in any database!\n\n❌ No bank data available.', parse_mode='Markdown')
+        await update.message.reply_text(f'🚫 BIN `{bin_num}` not found in any database!\n\n❌ No bank data available.', parse_mode='Markdown')
         return
     
     status = '✅ REAL' if result.is_real else '❌ FAKE'
     emoji = '🟢' if result.is_real else '🔴'
     
-    msg_text = (
+    msg = (
         f'{emoji} *BIN Information* [{status}]\n\n'
         f'🔢 *BIN:* `{result.bin}`\n'
         f'🏦 *Bank:* `{result.bank}`\n'
@@ -399,23 +382,23 @@ async def verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     
     if result.is_real:
-        msg_text += '✅ *This is a REAL BIN — CC generation allowed!* 🌹'
+        msg += '✅ *This is a REAL BIN — CC generation allowed!* 🌹'
     else:
-        msg_text += '❌ *This is a FAKE BIN — CC generation blocked!*'
+        msg += '❌ *This is a FAKE BIN — CC generation blocked!*'
     
-    await msg.edit_text(msg_text, parse_mode='Markdown')
+    await update.message.reply_text(msg, parse_mode='Markdown')
 
 async def range_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
         await update.message.reply_text('❌ Usage: `/range 400000 400100`', parse_mode='Markdown')
         return
     
-    start_bin, end_bin = context.args[0], context.args[1]
-    if not (start_bin.isdigit() and end_bin.isdigit()):
+    start, end = context.args[0], context.args[1]
+    if not (start.isdigit() and end.isdigit()):
         await update.message.reply_text('❌ Invalid BIN range! Must be numbers.')
         return
     
-    from_start, from_end = int(start_bin), int(end_bin)
+    from_start, from_end = int(start), int(end)
     if from_end < from_start:
         await update.message.reply_text('❌ End must be greater than start!')
         return
@@ -432,20 +415,18 @@ async def range_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE):
     results = []
     for i in range(from_start, from_end + 1):
         bin_str = f"{i:06d}"
-        result = await scraper.verify_bin(bin_str)
+        result = scraper.verify_bin(bin_str)
         if result and result.is_real:
             results.append(
                 f'✅ `{bin_str}` | 🏦 `{result.bank[:25]}` | '
                 f'🌍 `{result.country[:15]}` | 💎 `{result.brand}`'
             )
-        # Non-blocking delay
-        await asyncio.sleep(0.5)
+        time.sleep(0.5)  # Rate limit protection
     
     if not results:
         await msg.edit_text('🚫 No real BINs found in range!\n\nAll BINs in this range are fake/unregistered.', parse_mode='Markdown')
         return
     
-    # Send in chunks of 50 to avoid message limits
     header = f'🌹 *Real BINs Found ({len(results)}):*\n\n'
     chunks = []
     current_chunk = header
@@ -480,7 +461,7 @@ async def cc_gen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     msg = await update.message.reply_text(f'⏳ Verifying BIN `{bin_num}`...', parse_mode='Markdown')
-    bin_info = await scraper.verify_bin(bin_num)
+    bin_info = scraper.verify_bin(bin_num)
     
     if not bin_info:
         await msg.edit_text(f'🚫 BIN `{bin_num}` not found in any database!', parse_mode='Markdown')
@@ -503,16 +484,15 @@ async def cc_gen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
     
-    ccs, error = await scraper.generate_valid_cc(bin_num, qty)
+    ccs, error = scraper.generate_valid_cc(bin_num, qty)
     if error:
         await msg.edit_text(error, parse_mode='Markdown')
         return
     
-    # Build file content
     lines = [cc.to_pipe_format() for cc in ccs]
     file_content = '\n'.join(lines)
     
-    # Use BytesIO for proper file handling
+    # FIXED: BytesIO for Railway compatibility
     file_bytes = BytesIO(file_content.encode('utf-8'))
     file_bytes.name = f'ccs_{bin_num}.txt'
     
@@ -541,7 +521,7 @@ async def mass_gen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         qty = 5
     
-    qty = max(1, min(qty, 100))  # Lower cap for mass gen per BIN
+    qty = max(1, min(qty, 100))
     
     bins_list = [b.strip() for b in bins_str.split(',') 
                  if b.strip().isdigit() and len(b.strip()) == 6]
@@ -561,7 +541,7 @@ async def mass_gen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     real_bins = []
     
     for bin_num in bins_list:
-        ccs, error = await scraper.generate_valid_cc(bin_num, qty)
+        ccs, error = scraper.generate_valid_cc(bin_num, qty)
         if error:
             fake_bins.append(bin_num)
         else:
@@ -618,8 +598,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         '🌹 *BULK BIN SCRAPER - HELP* 🌹\n\n'
         '*What this bot does:*\n'
-        'This bot verifies if a BIN (Bank Identification Number) is real '
-        'by checking against multiple financial databases.\n\n'
+        'This bot verifies if a BIN is real by checking against multiple financial databases.\n\n'
         '*Commands:*\n'
         '`/verify <6-digit-BIN>` - Check if BIN is real\n'
         '`/range <start> <end>` - Scan a range of BINs\n'
@@ -630,9 +609,19 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(help_text, parse_mode='Markdown')
 
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == 'verify':
+        await query.edit_message_text('Send: `/verify 414720`', parse_mode='Markdown')
+    elif query.data == 'range':
+        await query.edit_message_text('Send: `/range 400000 400100`', parse_mode='Markdown')
+    elif query.data == 'cc':
+        await query.edit_message_text('Send: `/cc 414720 10`', parse_mode='Markdown')
+
 def main():
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print('❌ ERROR: Please set your BOT_TOKEN!')
+        print('❌ ERROR: Please set your BOT_TOKEN in the code!')
         return
     
     application = Application.builder().token(BOT_TOKEN).build()
@@ -644,10 +633,11 @@ def main():
     application.add_handler(CommandHandler('mass', mass_gen))
     application.add_handler(CommandHandler('stats', stats))
     application.add_handler(CommandHandler('help', help_cmd))
+    application.add_handler(CallbackQueryHandler(button_callback))
     
     print('🤖 Bot starting...')
     
-    if WEBHOOK_URL and WEBHOOK_URL != "YOUR_WEBHOOK_URL_HERE":
+    if WEBHOOK_URL:
         print(f'🌐 Webhook mode: {WEBHOOK_URL}')
         application.run_webhook(
             listen='0.0.0.0', 
