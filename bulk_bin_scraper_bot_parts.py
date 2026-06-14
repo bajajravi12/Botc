@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # BULK BIN SCRAPER TELEGRAM BOT v6.0
 
+import os
 import requests
 import time
 import random
@@ -11,7 +12,7 @@ from functools import wraps
 from telegram import Update
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_TOKEN = 'YOUR_BOT_TOKEN_HERE'
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 REQUEST_TIMEOUT = 10
 MAX_RETRIES = 3
 RETRY_DELAY = 1
