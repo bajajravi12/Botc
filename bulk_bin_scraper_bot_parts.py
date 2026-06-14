@@ -18,7 +18,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 # ============================================
 # CONFIGURATION - HARDCODED
 # ============================================
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # 🔴 CHANGE THIS
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # 🔴 CHANGE THIS
 WEBHOOK_URL = ""  # Leave empty for polling (Railway mein polling best hai)
 PORT = int(os.environ.get('PORT', '8080'))
 REQUEST_TIMEOUT = 10
