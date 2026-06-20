@@ -1,654 +1,461 @@
-import os
+#!/usr/bin/env python3
+"""
+CC Checker Telegram Bot v2.0 - Railway Compatible
+Education Purpose Only
+Author: RV
+
+Reads BOT_TOKEN from environment variable ONLY.
+No hardcoded token. No fallback.
+
+Railway: Set BOT_TOKEN in Variables tab.
+"""
+
 import re
-import random
-import logging
-import asyncio
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+import os
+import time
+import json
+import requests
+import threading
+from collections import Counter
 
-# ============== CONFIG ==============
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+# ============ TELEGRAM BOT SETUP ============
+# Read from environment variable ONLY - Railway compatible
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-# ============== LOGGING ==============
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+if not BOT_TOKEN:
+    print("[ERROR] BOT_TOKEN environment variable is not set!")
+    print("[INFO]  Please set BOT_TOKEN in your Railway Variables.")
+    exit(1)
 
-# ============== LUHN ALGORITHM ==============
-def luhn_check(card_number):
-    """Real Luhn algorithm validation"""
-    if not card_number.isdigit():
-        return False
-    
-    digits = [int(d) for d in card_number]
-    odd_digits = digits[-1::-2]
-    even_digits = digits[-2::-2]
-    
-    total = sum(odd_digits)
-    for d in even_digits:
-        d *= 2
-        if d > 9:
-            d -= 9
-        total += d
-    
-    return total % 10 == 0
+API_BASE = "https://api.telegram.org/bot" + BOT_TOKEN
 
-def get_card_type(number):
-    patterns = {
-        'VISA': r'^4',
-        'MASTERCARD': r'^5[1-5]',
-        'AMEX': r'^3[47]',
-        'DISCOVER': r'^6(?:011|5)',
-        'JCB': r'^(?:2131|1800|35)',
-        'DINERS': r'^3(?:0[0-5]|[68])'
-    }
-    for card_type, pattern in patterns.items():
-        if re.match(pattern, number):
-            return card_type
-    return 'UNKNOWN'
-
-def calculate_luhn_check(number):
-    """Calculate Luhn check digit"""
-    digits = [int(d) for d in number]
-    odd_digits = digits[-1::-2]
-    even_digits = digits[-2::-2]
-    
-    total = sum(odd_digits)
-    for d in even_digits:
-        d *= 2
-        if d > 9:
-            d -= 9
-        total += d
-    
-    return (10 - (total % 10)) % 10
-
-def validate_card(card_line):
-    """Validate single card line: number|MM|YY|CVV"""
-    parts = card_line.strip().split('|')
-    
-    if len(parts) != 4:
-        return {'valid': False, 'reason': 'Invalid format (need: number|MM|YY|CVV)'}
-    
-    number, mm, yy, cvv = parts
-    
-    if not number.isdigit():
-        return {'valid': False, 'reason': 'Card number must be digits only'}
-    
-    if len(number) < 13 or len(number) > 19:
-        return {'valid': False, 'reason': f'Invalid length ({len(number)} digits)'}
-    
-    if not luhn_check(number):
-        return {'valid': False, 'reason': 'Luhn check failed'}
-    
-    try:
-        month = int(mm)
-        if month < 1 or month > 12:
-            return {'valid': False, 'reason': 'Invalid month (1-12)'}
-    except:
-        return {'valid': False, 'reason': 'Invalid month format'}
-    
-    try:
-        year = int(yy)
-        if year < 0 or year > 99:
-            return {'valid': False, 'reason': 'Invalid year format'}
-    except:
-        return {'valid': False, 'reason': 'Invalid year format'}
-    
-    from datetime import datetime
-    current_year = datetime.now().year % 100
-    current_month = datetime.now().month
-    
-    if year < current_year or (year == current_year and month < current_month):
-        return {'valid': False, 'reason': 'Card expired'}
-    
-    card_type = get_card_type(number)
-    expected_cvv = 4 if card_type == 'AMEX' else 3
-    
-    if len(cvv) != expected_cvv or not cvv.isdigit():
-        return {'valid': False, 'reason': f'CVV must be {expected_cvv} digits'}
-    
-    return {
-        'valid': True,
-        'type': card_type,
-        'bin': number[:6],
-        'number': number,
-        'month': mm,
-        'year': yy,
-        'cvv': cvv
-    }
-
-# ============== BIN DATABASE ==============
-BIN_RANGES = {
-    '404594': {'brand': 'VISA', 'type': 'DEBIT', 'level': 'CLASSIC', 'bank': 'Chase Bank', 'country': 'US'},
-    '411111': {'brand': 'VISA', 'type': 'CREDIT', 'level': 'PLATINUM', 'bank': 'Test Bank', 'country': 'US'},
-    '401288': {'brand': 'VISA', 'type': 'CREDIT', 'level': 'CLASSIC', 'bank': 'Visa Test', 'country': 'US'},
-    '400000': {'brand': 'VISA', 'type': 'CREDIT', 'level': 'GOLD', 'bank': 'Various', 'country': 'US'},
-    '510000': {'brand': 'MASTERCARD', 'type': 'CREDIT', 'level': 'STANDARD', 'bank': 'Various', 'country': 'US'},
-    '520000': {'brand': 'MASTERCARD', 'type': 'DEBIT', 'level': 'STANDARD', 'bank': 'Various', 'country': 'US'},
-    '530000': {'brand': 'MASTERCARD', 'type': 'CREDIT', 'level': 'GOLD', 'bank': 'Various', 'country': 'US'},
-    '540000': {'brand': 'MASTERCARD', 'type': 'CREDIT', 'level': 'PLATINUM', 'bank': 'Various', 'country': 'US'},
-    '550000': {'brand': 'MASTERCARD', 'type': 'CREDIT', 'level': 'WORLD', 'bank': 'Various', 'country': 'US'},
-    '340000': {'brand': 'AMEX', 'type': 'CREDIT', 'level': 'PERSONAL', 'bank': 'Amex', 'country': 'US'},
-    '370000': {'brand': 'AMEX', 'type': 'CREDIT', 'level': 'PERSONAL', 'bank': 'Amex', 'country': 'US'},
-    '343434': {'brand': 'AMEX', 'type': 'CREDIT', 'level': 'GOLD', 'bank': 'Amex', 'country': 'US'},
-    '601100': {'brand': 'DISCOVER', 'type': 'CREDIT', 'level': 'STANDARD', 'bank': 'Discover', 'country': 'US'},
-    '601101': {'brand': 'DISCOVER', 'type': 'CREDIT', 'level': 'STANDARD', 'bank': 'Discover', 'country': 'US'},
-    '352800': {'brand': 'JCB', 'type': 'CREDIT', 'level': 'STANDARD', 'bank': 'JCB', 'country': 'JP'},
-    '353000': {'brand': 'JCB', 'type': 'CREDIT', 'level': 'GOLD', 'bank': 'JCB', 'country': 'JP'},
+# ============ CC CHECKER API CONFIG ============
+CC_API_URL = "https://uncoder.eu.org/cc-checker/api.php"
+CC_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+    "Referer": "https://uncoder.eu.org/cc-checker/",
+    "Origin": "https://uncoder.eu.org",
+    "Accept": "application/json",
+    "X-Requested-With": "XMLHttpRequest"
 }
 
-def get_bin_info(bin_number):
-    """Get BIN info from database"""
-    bin_str = str(bin_number)[:6]
-    
-    if bin_str in BIN_RANGES:
-        info = BIN_RANGES[bin_str].copy()
-        info['bin'] = bin_str
-        info['exact'] = True
-        return info
-    
-    bin_4 = bin_str[:4]
-    for key, value in BIN_RANGES.items():
-        if key.startswith(bin_4):
-            info = value.copy()
-            info['bin'] = bin_str
-            info['exact'] = False
-            info['matched'] = key
-            return info
-    
-    first_digit = bin_str[0]
-    brand_map = {
-        '4': 'VISA',
-        '5': 'MASTERCARD',
-        '3': 'AMEX',
-        '6': 'DISCOVER'
-    }
-    
-    return {
-        'bin': bin_str,
-        'brand': brand_map.get(first_digit, 'UNKNOWN'),
-        'type': 'UNKNOWN',
-        'level': 'UNKNOWN',
-        'bank': 'Unknown Bank',
-        'country': 'Unknown',
-        'exact': False,
-        'generated': True
-    }
-
-def generate_range(bin_info, count=10):
-    """Generate card numbers in range"""
-    bin_str = bin_info['bin']
-    cards = []
-    
-    for i in range(count):
-        remaining = 16 - len(bin_str)
-        last_digits = ''.join([str(random.randint(0, 9)) for _ in range(remaining - 1)])
-        partial = bin_str + last_digits
-        check_digit = calculate_luhn_check(partial)
-        full_number = partial + str(check_digit)
-        
-        month = random.randint(1, 12)
-        year = random.randint(24, 30)
-        cvv = random.randint(100, 999)
-        
-        cards.append(f"{full_number}|{month:02d}|{year}|{cvv}")
-    
-    return cards
-
-# ============== MESSAGES ==============
-LIVE_MESSAGES = [
-    "CVV2 match - approved",
-    "Approved - card active",
-    "Approved - $0 auth",
-    "Issuer approved"
-]
-
-DIE_MESSAGES = [
-    "Restricted card",
-    "Expired card on file",
-    "Card declined",
-    "Fraud suspicion - declined",
-    "Invalid card number",
-    "Stolen card"
-]
-
-# ============== ACTIVE CHECKS ==============
-active_checks = {}
-
-# ============== HANDLERS ==============
-
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command"""
-    keyboard = [
-        [InlineKeyboardButton("🚀 CC Checker", callback_data='cc_checker'),
-         InlineKeyboardButton("🔍 BIN Finder", callback_data='bin_finder')],
-        [InlineKeyboardButton("📖 Help", callback_data='help')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    welcome = """
-🚀 **CC CHECKER + BIN FINDER BOT**
-
-**Features:**
-✅ CC Checker (Luhn validation)
-✅ BIN Lookup & Range Generator
-✅ .txt file support
-✅ Real-time processing
-
-**Choose mode below or use commands:**
-• `/chk` - Check cards from file
-• `/bin <6_digit>` - Lookup BIN
-• `/range <bin> <count>` - Generate cards
-• `/gen <bin> <count>` - Quick generate
-
-**Powered by:** @YourChannel
-    """
-    await update.message.reply_text(welcome, reply_markup=reply_markup, parse_mode='Markdown')
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Help command"""
-    help_text = """
-📖 **HELP MENU**
-
-**🚀 CC CHECKER:**
-Upload `.txt` file with cards in format:
-`number|MM|YY|CVV`
-
-Reply with `/chk` to start checking
-
-**🔍 BIN FINDER:**
-• `/bin 404594` - Lookup BIN info
-• `/range 404594 20` - Generate 20 cards
-• `/gen 510000 10` - Quick generate
-• `/chkbin 404594...` - Check full card
-
-**✅ Checks:**
-• Luhn Algorithm
-• Card length (13-19 digits)
-• Card type detection
-• Expiry validation
-• CVV length check
-• BIN extraction
-    """
-    await update.message.reply_text(help_text, parse_mode='Markdown')
-
-async def chk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Check cards from replied file"""
-    user_id = update.effective_user.id
-    
-    # Check if replying to a message
-    if not update.message.reply_to_message:
-        await update.message.reply_text(
-            "❌ **Reply to a `.txt` file** with `/chk` command!\n\n"
-            "1. Upload `.txt` file\n"
-            "2. Reply to it with `/chk`",
-            parse_mode='Markdown'
-        )
-        return
-    
-    replied = update.message.reply_to_message
-    
-    # Check if file exists
-    if not replied.document:
-        await update.message.reply_text("❌ **No file found!** Reply to a `.txt` file.")
-        return
-    
-    file_name = replied.document.file_name or "unknown"
-    
-    if not file_name.endswith('.txt'):
-        await update.message.reply_text("❌ **Only `.txt` files supported!**")
-        return
-    
-    # Download file
-    status_msg = await update.message.reply_text("📥 **Downloading file...**")
-    
-    try:
-        file_obj = await context.bot.get_file(replied.document.file_id)
-        file_path = f"/tmp/{file_name}"
-        await file_obj.download_to_drive(file_path)
-        
-        # Read cards
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            lines = f.readlines()
-        
-        cards = [line.strip() for line in lines if line.strip()]
-        
-        if not cards:
-            await status_msg.edit_text("❌ **No cards found in file!**")
-            os.remove(file_path)
-            return
-        
-        # Start checking
-        active_checks[user_id] = True
-        
-        await status_msg.edit_text(
-            f"🚀 **STARTING CHECK**\n\n"
-            f"📁 File: `{file_name}`\n"
-            f"📊 Total Cards: `{len(cards)}`\n"
-            f"⏳ Status: Processing...",
-            parse_mode='Markdown'
-        )
-        
-        live_cards = []
-        die_cards = []
-        checked = 0
-        
-        # Process cards
-        for card_line in cards:
-            if not active_checks.get(user_id, False):
-                break
-            
-            result = validate_card(card_line)
-            checked += 1
-            
-            if result['valid']:
-                live_cards.append({
-                    'line': card_line,
-                    'type': result['type'],
-                    'bin': result['bin']
-                })
-            else:
-                die_cards.append({
-                    'line': card_line,
-                    'reason': result['reason']
-                })
-            
-            # Update every 5 cards
-            if checked % 5 == 0 or checked == len(cards):
-                progress = (checked / len(cards)) * 100
-                
-                status_text = (
-                    f"🚀 **CHECKING CARDS**\n\n"
-                    f"📁 File: `{file_name}`\n"
-                    f"📊 Total: `{len(cards)}`\n"
-                    f"✅ Live: `{len(live_cards)}`\n"
-                    f"❌ Die: `{len(die_cards)}`\n"
-                    f"⏳ Checked: `{checked}/{len(cards)}` ({progress:.1f}%)"
-                )
-                await status_msg.edit_text(status_text, parse_mode='Markdown')
-                await asyncio.sleep(0.3)
-        
-        # Final results
-        active_checks[user_id] = False
-        
-        # Send live results
-        if live_cards:
-            live_text = f"✅ **LIVE CARDS - {len(live_cards)}**\n\n"
-            live_text += "Format: number|MM|YY|CVV\n"
-            live_text += "═" * 30 + "\n\n"
-            
-            for i, card in enumerate(live_cards, 1):
-                msg = LIVE_MESSAGES[i % len(LIVE_MESSAGES)]
-                live_text += f"💳 `{card['line']}`\n"
-                live_text += f"   Type: {card['type']} | BIN: {card['bin']}\n"
-                live_text += f"   Status: {msg}\n\n"
-            
-            # Split if too long
-            if len(live_text) > 4000:
-                chunks = [live_text[i:i+4000] for i in range(0, len(live_text), 4000)]
-                for chunk in chunks:
-                    await update.message.reply_text(chunk, parse_mode='Markdown')
-            else:
-                await update.message.reply_text(live_text, parse_mode='Markdown')
-        
-        # Send die results
-        if die_cards:
-            die_text = f"❌ **DIE CARDS - {len(die_cards)}**\n\n"
-            die_text += "═" * 30 + "\n\n"
-            
-            for i, card in enumerate(die_cards, 1):
-                die_text += f"💀 `{card['line']}`\n"
-                die_text += f"   Reason: {card['reason']}\n\n"
-            
-            if len(die_text) > 4000:
-                chunks = [die_text[i:i+4000] for i in range(0, len(die_text), 4000)]
-                for chunk in chunks:
-                    await update.message.reply_text(chunk, parse_mode='Markdown')
-            else:
-                await update.message.reply_text(die_text, parse_mode='Markdown')
-        
-        # Final summary
-        summary = (
-            f"🏁 **CHECK COMPLETE**\n\n"
-            f"📁 File: `{file_name}`\n"
-            f"📊 Total Cards: `{len(cards)}`\n"
-            f"✅ Live: `{len(live_cards)}`\n"
-            f"❌ Die: `{len(die_cards)}`\n"
-            f"📈 Success Rate: `{(len(live_cards)/len(cards)*100):.1f}%`\n\n"
-            f"**Thanks for using CC Checker!** 🚀"
-        )
-        await status_msg.edit_text(summary, parse_mode='Markdown')
-        
-        # Cleanup
-        os.remove(file_path)
-        
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        await status_msg.edit_text(f"❌ **Error:** `{str(e)}`")
-        if os.path.exists(file_path):
-            os.remove(file_path)
-
-async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Stop current check"""
-    user_id = update.effective_user.id
-    if user_id in active_checks:
-        active_checks[user_id] = False
-        await update.message.reply_text("🛑 **Check stopped!**")
+# ============ CARD NETWORK DETECTION ============
+def get_card_network(card_number):
+    card_str = str(card_number)
+    if card_str.startswith('4'):
+        return 'VISA'
+    elif card_str[:2] in ['51','52','53','54','55'] or (222100 <= int(card_str[:6]) <= 272099):
+        return 'MASTERCARD'
+    elif card_str[:2] in ['34','37']:
+        return 'AMEX'
+    elif card_str[:4] == '6011' or card_str[:3] in ['644','645','646','647','648','649'] or (622126 <= int(card_str[:6]) <= 622925):
+        return 'DISCOVER'
+    elif card_str[:2] in ['62','81']:
+        return 'UNIONPAY'
+    elif card_str[:3] in ['300','301','302','303','304','305'] or card_str[:2] in ['36','38','39']:
+        return 'DINERS'
+    elif card_str[:2] in ['35']:
+        return 'JCB'
     else:
-        await update.message.reply_text("❌ No active check to stop!")
+        return 'UNKNOWN'
 
-async def bin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """BIN lookup command"""
-    if not context.args:
-        await update.message.reply_text(
-            "❌ **Usage:** `/bin <6_digit_bin>`\n\n"
-            "Example: `/bin 404594`",
-            parse_mode='Markdown'
-        )
-        return
-    
-    bin_num = context.args[0]
-    if not bin_num.isdigit() or len(bin_num) != 6:
-        await update.message.reply_text("❌ **BIN must be 6 digits!**")
-        return
-    
-    info = get_bin_info(bin_num)
-    exact_text = "✅ Exact Match" if info['exact'] else "⚠️ Estimated"
-    
-    result = (
-        f"🔍 **BIN LOOKUP RESULT**\n\n"
-        f"**BIN:** `{info['bin']}`\n"
-        f"**Status:** {exact_text}\n\n"
-        f"📋 **Card Details:**\n"
-        f"• **Brand:** {info['brand']}\n"
-        f"• **Type:** {info['type']}\n"
-        f"• **Level:** {info['level']}\n"
-        f"• **Bank:** {info['bank']}\n"
-        f"• **Country:** {info['country']}\n\n"
-        f"**Card Range:**\n"
-        f"`{info['bin']}0000000` - `{info['bin']}9999999`\n\n"
-        f"Use `/range {info['bin']} 10` to generate cards"
-    )
-    await update.message.reply_text(result, parse_mode='Markdown')
+# ============ API CHECK ============
+def check_card_api(card_num, mm, yy, cvv, retries=2):
+    card_data = card_num + "|" + mm + "|" + yy + "|" + cvv
+    data = {"data": card_data}
 
-async def range_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generate range from BIN"""
-    if len(context.args) < 2:
-        await update.message.reply_text(
-            "❌ **Usage:** `/range <6_digit_bin> <count>`\n\n"
-            "Example: `/range 404594 20`",
-            parse_mode='Markdown'
-        )
-        return
-    
-    bin_num = context.args[0]
-    try:
-        count = min(int(context.args[1]), 50)
-    except:
-        count = 10
-    
-    if not bin_num.isdigit() or len(bin_num) != 6:
-        await update.message.reply_text("❌ **BIN must be 6 digits!**")
-        return
-    
-    info = get_bin_info(bin_num)
-    
-    status = await update.message.reply_text(
-        f"🔄 Generating {count} cards for BIN `{bin_num}`...",
-        parse_mode='Markdown'
-    )
-    
-    cards = generate_range(info, count)
-    
-    # Save to file
-    filename = f"/tmp/bin_{bin_num}_range.txt"
-    with open(filename, 'w') as f:
-        f.write(f"# BIN: {bin_num}\n")
-        f.write(f"# Brand: {info['brand']}\n")
-        f.write(f"# Type: {info['type']}\n")
-        f.write(f"# Level: {info['level']}\n")
-        f.write(f"# Bank: {info['bank']}\n")
-        f.write(f"# Country: {info['country']}\n")
-        f.write(f"# Generated: {count} cards\n")
-        f.write("=" * 40 + "\n\n")
+    for attempt in range(retries + 1):
+        try:
+            response = requests.post(CC_API_URL, data=data, headers=CC_HEADERS, timeout=15, allow_redirects=True)
+            if response.status_code == 200:
+                try:
+                    return response.json()
+                except:
+                    return {"status": "error", "message": "Invalid JSON"}
+            else:
+                return {"status": "error", "message": "HTTP " + str(response.status_code)}
+        except requests.exceptions.Timeout:
+            if attempt < retries:
+                time.sleep(2)
+                continue
+            return {"status": "error", "message": "Timeout"}
+        except requests.exceptions.ConnectionError:
+            if attempt < retries:
+                time.sleep(2)
+                continue
+            return {"status": "error", "message": "Connection Error"}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+    return {"status": "error", "message": "Max retries"}
+
+# ============ PARSE API RESULT ============
+def parse_result(api_result, card_num, mm, yy, cvv):
+    network = get_card_network(card_num)
+    status = api_result.get("status", "unknown")
+    message = api_result.get("message", "Unknown")
+
+    if status == "live":
+        return {"card": card_num, "mm": mm, "yy": yy, "cvv": cvv, "network": network, "status": "LIVE", "reason": message}
+    elif status == "die":
+        return {"card": card_num, "mm": mm, "yy": yy, "cvv": cvv, "network": network, "status": "DIE", "reason": message}
+    else:
+        return {"card": card_num, "mm": mm, "yy": yy, "cvv": cvv, "network": network, "status": "UNKNOWN", "reason": message}
+
+# ============ RVOUPUT FUNCTIONS ============
+def get_rvoutput_path():
+    return os.path.join(os.getcwd(), "rvoutput.txt")
+
+def append_to_rvoutput(cards):
+    if not cards:
+        return 0
+
+    rvoutput_path = get_rvoutput_path()
+    existing = set()
+
+    if os.path.exists(rvoutput_path):
+        try:
+            with open(rvoutput_path, 'r') as f:
+                for line in f:
+                    existing.add(line.strip())
+        except:
+            pass
+
+    new_count = 0
+    with open(rvoutput_path, 'a') as f:
         for card in cards:
-            f.write(card + "\n")
-    
-    # Send file
-    await context.bot.send_document(
-        chat_id=update.effective_chat.id,
-        document=open(filename, 'rb'),
-        caption=(
-            f"✅ **RANGE GENERATED**\n\n"
-            f"🔍 **BIN:** `{bin_num}`\n"
-            f"📊 **Count:** `{count}` cards\n"
-            f"💳 **Brand:** {info['brand']}\n"
-            f"🏦 **Bank:** {info['bank']}\n\n"
-            f"**Format:** number|MM|YY|CVV\n\n"
-            f"Use with `/chk` command!"
-        ),
-        parse_mode='Markdown'
-    )
-    
-    await status.delete()
-    os.remove(filename)
+            card_line = card['card'] + "|" + card['mm'] + "|" + card['yy'] + "|" + card['cvv']
+            if card_line not in existing:
+                f.write(card_line + "\n")
+                existing.add(card_line)
+                new_count += 1
 
-async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Quick generate alias"""
-    await range_cmd(update, context)
+    return new_count
 
-async def chkbin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Check BIN from full card"""
-    if not context.args:
-        await update.message.reply_text(
-            "❌ **Usage:** `/chkbin <card_number>`\n\n"
-            "Example: `/chkbin 4045947406237512`",
-            parse_mode='Markdown'
-        )
-        return
-    
-    card_num = context.args[0].replace('|', '').replace(' ', '')
-    if not card_num.isdigit():
-        await update.message.reply_text("❌ **Card number must be digits only!**")
-        return
-    
-    bin_num = card_num[:6]
-    info = get_bin_info(bin_num)
-    valid = luhn_check(card_num)
-    detected_type = get_card_type(card_num)
-    
-    result = (
-        f"🔍 **CARD ANALYSIS**\n\n"
-        f"**Number:** `{card_num}`\n"
-        f"**BIN:** `{bin_num}`\n\n"
-        f"📋 **BIN Info:**\n"
-        f"• **Brand:** {info['brand']} (Detected: {detected_type})\n"
-        f"• **Type:** {info['type']}\n"
-        f"• **Level:** {info['level']}\n"
-        f"• **Bank:** {info['bank']}\n"
-        f"• **Country:** {info['country']}\n\n"
-        f"✅ **Luhn Check:** {'PASS ✓' if valid else 'FAIL ✗'}\n"
-        f"📏 **Length:** {len(card_num)} digits\n\n"
-        f"**Status:** {'✅ VALID' if valid else '❌ INVALID'}"
-    )
-    await update.message.reply_text(result, parse_mode='Markdown')
+def get_rvoutput_count():
+    rvoutput_path = get_rvoutput_path()
+    if os.path.exists(rvoutput_path):
+        with open(rvoutput_path, 'r') as f:
+            return len([l for l in f if l.strip()])
+    return 0
 
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show stats"""
-    stats_text = (
-        f"📊 **BOT STATISTICS**\n\n"
-        f"🤖 **Status:** Online ✅\n"
-        f"⚡ **Algorithm:** Luhn Check\n"
-        f"🔍 **Validation:** Real-time\n"
-        f"📁 **File Support:** .txt files\n\n"
-        f"**Supported Cards:**\n"
-        f"💳 VISA\n"
-        f"💳 MasterCard\n"
-        f"💳 American Express\n"
-        f"💳 Discover\n"
-        f"💳 JCB\n"
-        f"💳 Diners Club\n\n"
-        f"**Commands:**\n"
-        f"• `/chk` - Check cards\n"
-        f"• `/bin` - BIN lookup\n"
-        f"• `/range` - Generate range\n"
-        f"• `/gen` - Quick generate\n"
-        f"• `/chkbin` - Check card\n"
-        f"• `/stop` - Stop check"
-    )
-    await update.message.reply_text(stats_text, parse_mode='Markdown')
-
-async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Auto-detect file upload"""
-    if update.message.document and update.message.document.file_name.endswith('.txt'):
-        await update.message.reply_text(
-            "📁 **File received!**\n\n"
-            "Reply with `/chk` to start checking cards.\n\n"
-            "**Format:** `number|MM|YY|CVV`",
-            parse_mode='Markdown'
-        )
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle errors"""
-    logger.error(f"Update {update} caused error {context.error}")
+# ============ TELEGRAM API FUNCTIONS ============
+def send_message(chat_id, text, parse_mode="HTML"):
+    url = API_BASE + "/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True
+    }
     try:
-        if update and update.effective_message:
-            await update.effective_message.reply_text(
-                "❌ **An error occurred!**\nPlease try again later."
-            )
+        requests.post(url, json=payload, timeout=10)
     except:
         pass
 
-# ============== MAIN ==============
-def main():
-    """Start the bot"""
-    # Create application
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    # Add handlers
-    application.add_handler(CommandHandler("start", start_cmd))
-    application.add_handler(CommandHandler("help", help_cmd))
-    application.add_handler(CommandHandler("chk", chk_cmd))
-    application.add_handler(CommandHandler("stop", stop_cmd))
-    application.add_handler(CommandHandler("bin", bin_cmd))
-    application.add_handler(CommandHandler("range", range_cmd))
-    application.add_handler(CommandHandler("gen", gen_cmd))
-    application.add_handler(CommandHandler("chkbin", chkbin_cmd))
-    application.add_handler(CommandHandler("stats", stats_cmd))
-    
-    # File handler
-    application.add_handler(MessageHandler(filters.Document.TEXT, file_handler))
-    
-    # Error handler
-    application.add_error_handler(error_handler)
-    
-    # Start bot
-    print("🚀 Bot Starting...")
-    print("📁 Send .txt file and reply with /chk")
-    print("🔍 Use /bin for BIN lookup")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+def send_document(chat_id, file_path, caption=""):
+    url = API_BASE + "/sendDocument"
+    try:
+        with open(file_path, 'rb') as f:
+            files = {'document': f}
+            data = {'chat_id': chat_id, 'caption': caption}
+            requests.post(url, files=files, data=data, timeout=30)
+    except Exception as e:
+        send_message(chat_id, "<b>Error sending file:</b>\n<code>" + str(e) + "</code>")
 
-if __name__ == '__main__':
+def edit_message(chat_id, message_id, text, parse_mode="HTML"):
+    url = API_BASE + "/editMessageText"
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True
+    }
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except:
+        pass
+
+def send_status_message(chat_id, text):
+    url = API_BASE + "/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML"
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        return resp.json()["result"]["message_id"]
+    except:
+        return None
+
+# ============ FORMAT RESULTS ============
+def format_summary(live, die, unknown, total):
+    return "<b>📊 CHECKING COMPLETE</b>\n\n" + \
+           "<b>✅ LIVE:</b> <code>" + str(live) + "</code> cards\n" + \
+           "<b>❌ DIE:</b> <code>" + str(die) + "</code> cards\n" + \
+           "<b>⚠️ UNKNOWN:</b> <code>" + str(unknown) + "</code> cards\n\n" + \
+           "<b>📁 Total Checked:</b> <code>" + str(total) + "</code>\n" + \
+           "<b>💾 rvoutput.txt:</b> <code>" + str(get_rvoutput_count()) + "</code> total LIVE cards"
+
+# ============ PROCESS FILE ============
+def process_cards_file(file_path, chat_id, status_message_id):
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            lines = [line.strip() for line in f if line.strip()]
+    except Exception as e:
+        edit_message(chat_id, status_message_id, "<b>❌ Error reading file:</b>\n<code>" + str(e) + "</code>")
+        return
+
+    total = len(lines)
+    live_cards = []
+    die_cards = []
+    unknown_cards = []
+
+    edit_message(chat_id, status_message_id, 
+        "<b>🚀 Starting Check...</b>\n\n" +
+        "<b>📁 Total Cards:</b> <code>" + str(total) + "</code>\n" +
+        "<b>⏳ Progress:</b> <code>0/" + str(total) + "</code>\n" +
+        "<b>✅ LIVE:</b> <code>0</code> | <b>❌ DIE:</b> <code>0</code>\n\n" +
+        "<i>Checking in progress... Please wait ⏳</i>")
+
+    for i, line in enumerate(lines, 1):
+        match = re.match(r'(\d{16})\|(\d{2})\|(\d{2})\|(\d{3})', line)
+        if not match:
+            continue
+
+        card_num, mm, yy, cvv = match.groups()
+
+        api_result = check_card_api(card_num, mm, yy, cvv)
+        result = parse_result(api_result, card_num, mm, yy, cvv)
+
+        if result["status"] == "LIVE":
+            live_cards.append(result)
+        elif result["status"] == "DIE":
+            die_cards.append(result)
+        else:
+            unknown_cards.append(result)
+
+        if i % 5 == 0 or i == total:
+            edit_message(chat_id, status_message_id,
+                "<b>🚀 Checking Cards...</b>\n\n" +
+                "<b>📁 Total:</b> <code>" + str(total) + "</code>\n" +
+                "<b>⏳ Progress:</b> <code>" + str(i) + "/" + str(total) + "</code>\n" +
+                "<b>✅ LIVE:</b> <code>" + str(len(live_cards)) + "</code> | <b>❌ DIE:</b> <code>" + str(len(die_cards)) + "</code>\n\n" +
+                "<i>Please wait... ⏳</i>")
+
+        if i < total:
+            time.sleep(2)
+
+    new_count = append_to_rvoutput(live_cards)
+
+    summary = format_summary(len(live_cards), len(die_cards), len(unknown_cards), total)
+
+    if new_count > 0:
+        summary += "\n\n<b>📝 New LIVE cards added:</b> <code>" + str(new_count) + "</code>\n"
+        summary += "<b>💾 Total in rvoutput.txt:</b> <code>" + str(get_rvoutput_count()) + "</code>"
+
+    edit_message(chat_id, status_message_id, summary)
+
+    # Send LIVE cards
+    if live_cards:
+        live_text = "<b>✅ LIVE CARDS:</b>\n\n"
+        for card in live_cards:
+            live_text += "<code>" + card['card'] + "|" + card['mm'] + "|" + card['yy'] + "|" + card['cvv'] + "</code>\n"
+
+        if len(live_text) > 4000:
+            chunks = []
+            current = "<b>✅ LIVE CARDS:</b>\n\n"
+            for card in live_cards:
+                line = "<code>" + card['card'] + "|" + card['mm'] + "|" + card['yy'] + "|" + card['cvv'] + "</code>\n"
+                if len(current) + len(line) > 4000:
+                    chunks.append(current)
+                    current = "<b>✅ LIVE CARDS (cont.):</b>\n\n" + line
+                else:
+                    current += line
+            chunks.append(current)
+
+            for chunk in chunks:
+                send_message(chat_id, chunk)
+        else:
+            send_message(chat_id, live_text)
+
+    # Send DIE cards
+    if die_cards:
+        die_text = "<b>❌ DIE CARDS:</b>\n\n"
+        for card in die_cards[:50]:
+            die_text += "<code>" + card['card'] + "|" + card['mm'] + "|" + card['yy'] + "|" + card['cvv'] + "</code>\n"
+
+        if len(die_cards) > 50:
+            die_text += "\n<i>... and " + str(len(die_cards) - 50) + " more</i>"
+
+        send_message(chat_id, die_text)
+
+    # Clean up
+    try:
+        os.remove(file_path)
+    except:
+        pass
+
+# ============ HANDLE COMMANDS ============
+def handle_start(chat_id):
+    welcome = """<b>🃏 Welcome to CC Checker Bot!</b>
+
+<i>Education Purpose Only</i>
+
+<b>📋 Commands:</b>
+<code>/check</code> - Upload cards file to check
+<code>/rvoutput</code> - Get all LIVE cards (rvoutput.txt)
+<code>/status</code> - Check bot status
+<code>/help</code> - Show this help
+
+<b>📁 File Format:</b>
+<code>CARD|MM|YY|CVV</code>
+
+<b>Example:</b>
+<code>4246173334980266|07|29|702</code>
+<code>5424320941998014|12|31|542</code>
+
+<b>💾 LIVE cards auto-save to rvoutput.txt</b>
+
+<i>By RV</i>"""
+    send_message(chat_id, welcome)
+
+def handle_help(chat_id):
+    handle_start(chat_id)
+
+def handle_status(chat_id):
+    rv_count = get_rvoutput_count()
+    status = "<b>🤖 Bot Status</b>\n\n" + \
+             "<b>✅ Bot:</b> Online\n" + \
+             "<b>💾 rvoutput.txt:</b> <code>" + str(rv_count) + "</code> LIVE cards\n" + \
+             "<b>🔌 API:</b> uncoder.eu.org\n\n" + \
+             "<i>Bot is ready to check cards!</i>"
+    send_message(chat_id, status)
+
+def handle_rvoutput(chat_id):
+    rvoutput_path = get_rvoutput_path()
+
+    if not os.path.exists(rvoutput_path):
+        send_message(chat_id, "<b>❌ rvoutput.txt not found!</b>\n\n<i>No LIVE cards saved yet.</i>")
+        return
+
+    count = get_rvoutput_count()
+    send_document(chat_id, rvoutput_path, "<b>📁 rvoutput.txt</b>\n<b>Total LIVE cards:</b> <code>" + str(count) + "</code>")
+
+def handle_check(chat_id):
+    send_message(chat_id, 
+        "<b>📤 Send Cards File</b>\n\n" +
+        "Please upload a <code>.txt</code> file with cards in format:\n" +
+        "<code>CARD|MM|YY|CVV</code>\n\n" +
+        "<i>One card per line</i>")
+
+def handle_document(chat_id, file_id, file_name):
+    if not file_name.endswith('.txt'):
+        send_message(chat_id, "<b>❌ Invalid file!</b>\n\nPlease send a <code>.txt</code> file.")
+        return
+
+    file_info_url = API_BASE + "/getFile"
+    try:
+        resp = requests.post(file_info_url, json={"file_id": file_id}, timeout=10)
+        file_path = resp.json()["result"]["file_path"]
+    except:
+        send_message(chat_id, "<b>❌ Error downloading file!</b>")
+        return
+
+    download_url = "https://api.telegram.org/file/bot" + BOT_TOKEN + "/" + file_path
+    try:
+        file_resp = requests.get(download_url, timeout=30)
+        temp_path = "/tmp/" + file_name
+        with open(temp_path, 'wb') as f:
+            f.write(file_resp.content)
+    except:
+        send_message(chat_id, "<b>❌ Error saving file!</b>")
+        return
+
+    status_msg = send_status_message(chat_id, "<b>🚀 Processing file...</b>\n\n<i>Please wait ⏳</i>")
+
+    thread = threading.Thread(target=process_cards_file, args=(temp_path, chat_id, status_msg))
+    thread.start()
+
+# ============ POLLING ============
+def get_updates(offset=None):
+    url = API_BASE + "/getUpdates"
+    params = {"timeout": 30, "limit": 100}
+    if offset:
+        params["offset"] = offset
+
+    try:
+        resp = requests.get(url, params=params, timeout=35)
+        return resp.json().get("result", [])
+    except:
+        return []
+
+def process_update(update):
+    if "message" not in update:
+        return
+
+    message = update["message"]
+    chat_id = message["chat"]["id"]
+
+    if "text" in message:
+        text = message["text"]
+
+        if text == "/start":
+            handle_start(chat_id)
+        elif text == "/help":
+            handle_help(chat_id)
+        elif text == "/status":
+            handle_status(chat_id)
+        elif text == "/rvoutput":
+            handle_rvoutput(chat_id)
+        elif text == "/check":
+            handle_check(chat_id)
+        else:
+            send_message(chat_id, "<b>❓ Unknown command!</b>\n\nUse <code>/help</code> for available commands.")
+
+    elif "document" in message:
+        doc = message["document"]
+        file_id = doc["file_id"]
+        file_name = doc.get("file_name", "unknown.txt")
+        handle_document(chat_id, file_id, file_name)
+
+# ============ MAIN ============
+def main():
+    print("=" * 55)
+    print("  CC CHECKER TELEGRAM BOT v2.0")
+    print("  Railway Compatible")
+    print("=" * 55)
+    print("")
+    print("  Bot Token: " + BOT_TOKEN[:15] + "...")
+    print("  API: " + CC_API_URL)
+    print("  rvoutput.txt: " + get_rvoutput_path())
+    print("")
+    print("  Starting polling...")
+    print("  Press Ctrl+C to stop")
+    print("")
+
+    offset = None
+
+    while True:
+        try:
+            updates = get_updates(offset)
+
+            for update in updates:
+                update_id = update["update_id"]
+                offset = update_id + 1
+
+                thread = threading.Thread(target=process_update, args=(update,))
+                thread.start()
+
+            time.sleep(1)
+
+        except KeyboardInterrupt:
+            print("\n  Bot stopped!")
+            break
+        except Exception as e:
+            print("  Error: " + str(e))
+            time.sleep(5)
+
+if __name__ == "__main__":
     main()
